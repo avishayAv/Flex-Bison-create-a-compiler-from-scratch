@@ -1,0 +1,1129 @@
+%{
+	#include <iostream>
+
+    void scoped_finished();
+	extern int yylex();
+	#include "output.hpp"
+	//func declarations
+	void yyerror(const char*);
+	#include "parser.hpp"
+	SymbolTable symbol_table;
+	int preCondsCount = 0;
+	int formalCount = 0;
+	vector<string> currFormals = vector<string>();
+	string return_type;
+	extern int yylineno;
+	#define lineno yylineno
+	using namespace output;
+    string upperCase(string);
+    void storeAll();
+    void restoreAll();
+    void storeRegs();
+    void restoreRegs();
+    void storeRA();
+    void popRA();
+
+    void storeFP();
+    void popFP();
+    #include "bp.hpp"
+    #include "reg_utils.h"
+    #define BUFFER (CodeBuffer::instance())
+    Regs regs;
+    #define StackElement Parameter
+    int string_counter = 0;
+    stack<StackElement> expressions_list;
+    stack<vector<string>> regsToRestore;
+    vector<PreCondition> precond_list;
+    string pre_cond_error;
+
+%}
+
+%right ASSIGN
+%left OR
+%left AND
+%nonassoc RELOP
+%left BINOP
+%right NOT
+%left LPAREN
+%left RPAREN
+%token RBRACE
+%token VOID
+%token INT
+%token BYTE
+%token B
+%token BOOL
+%token TRUE
+%token FALSE
+%token RETURN
+%token IF
+%nonassoc T
+%precedence ELSE
+%token WHILE
+%token CONTINUE
+%token PRECOND
+%token COMMA
+%token LBRACE
+%token ID
+%token NUM
+%token STRING
+%token BREAK
+%token SC
+
+
+%%
+
+Program :	        {
+                        vector<Parameter> params_print;
+                        params_print.push_back(Parameter("", "void", 1));
+                        params_print.push_back(Parameter("", "string", 1));
+
+                        Record print("print","function",0, params_print);
+                        vector<Parameter> params_printi;
+                        params_printi.push_back(Parameter("", "void", 1));
+                        params_printi.push_back(Parameter("", "int", 1));
+
+                        Record printi("printi","function",0, params_printi);
+                        symbol_table.Record_insertion(print, 0);
+                        symbol_table.Record_insertion(printi, 0);
+
+                        //MIPS init main
+                        BUFFER.emit(".globl main");
+                        BUFFER.emit(".ent main");
+                        //handle hard-coded functions
+                        BUFFER.emit("printi: lw $a0, 0($sp)"); //todo: handle avishay tembel
+                        BUFFER.emit("li $v0, 1");
+                        BUFFER.emit("syscall");
+                        BUFFER.emit("jr $ra");
+                        BUFFER.emit("print: lw $a0, 0($sp)");   //todo: handle avishay tembel
+                        BUFFER.emit("li $v0, 4");
+                        BUFFER.emit("syscall");
+                        BUFFER.emit("jr $ra");
+                        pre_cond_error = BUFFER.genLabel();
+                        BUFFER.emit("li $v0 , 4");  //print error string  //todo: add print of func name
+                        BUFFER.emit("la $a0, preCondLabel");
+                        BUFFER.emit("syscall");
+                        BUFFER.emit("li $v0 , 10");  //terminate
+                        BUFFER.emit("syscall");
+
+
+
+                    }
+            Funcs
+
+;
+
+Funcs :		 /*epsilon*/
+			|FuncDecl Funcs
+;
+
+FuncDecl :
+			RetType ID
+			{
+				Record curr_rec = symbol_table.SymbolTableSearch(((Identifier*)$2)->name);
+				if (curr_rec.offset != ERROR_TYPE){errorDef(lineno,((Identifier*)$2)->name); exit(1);}
+				return_type = ((Type*)$1)->type;
+				Record new_rec(((Identifier*)$2)->name,"function",symbol_table.offsets.top());
+				symbol_table.Record_insertion(new_rec, 0);
+				symbol_table.insertTable(&symbol_table.tables.top(), symbol_table.offsets.top(),return_type);
+				preCondsCount = 0;
+				precond_list.clear();
+				currFormals = vector<string>();
+				formalCount = 0;
+
+			}
+			LPAREN Formals RPAREN
+			 {
+                vector<Parameter> params;
+                Parameter param1("", return_type, 1);
+                params.push_back(param1);
+                for (int i=0; i<currFormals.size(); i++)	{
+                    Parameter param("", currFormals[i], 1);
+                    params.push_back(param);
+                }
+                symbol_table.updateRecordFormals(((Identifier*)$2)->name,params);
+                BUFFER.emit(((Identifier*)$2)->name + ":");
+                if (((Identifier*)$2)->name == "main")  {
+                    string reg = regs.allocateReg();
+                    BUFFER.emit("sub " + reg + " , $sp, 4");
+                    BUFFER.emit("move $fp, " + reg);
+                    regs.releaseReg();
+                }
+			 }
+			 PreConditions LBRACE M_QUAD Statements RBRACE
+			{
+			    BUFFER.bpatch(((PreCondition*)$6)->true_list,(((MyString*)$8)->text));  // todo: maybe should be differnent number
+                BUFFER.bpatch(((PreCondition*)$6)->false_list, pre_cond_error);
+				endScope();
+				printPreconditions(((Identifier*)$2)->name, preCondsCount);
+				symbol_table.tables.top().PrintTableBeforeRemove();
+				symbol_table.RemoveTable();
+				string end_function = BUFFER.genLabel();
+				BUFFER.bpatch(((Statement*)$9)->next_list, end_function);  // todo: maybe should be differnent number
+				BUFFER.emit("move $sp, $fp");
+				BUFFER.emit("add $sp, $sp, 4");
+				if (((Identifier*)$2)->name != "main")  {
+				    BUFFER.emit("jr $ra");
+				}
+				else    {
+				    string end_main = BUFFER.genLabel();
+				    BUFFER.emit("la $ra, " + end_main);
+				    BUFFER.emit("li $v0, 10");      //terminate
+				    BUFFER.emit("syscall");
+				    BUFFER.emit(".end main");
+				}
+			}
+;
+
+RetType : 	Type
+			{
+				$$ = $1;
+			}
+			| VOID
+			{
+				$$ = new Type("void");
+			}
+;
+
+Formals :	 /*epsilon*/
+			{
+				$$ = new FormalList(vector<Formal>());
+			}
+			| FormalsList
+			{
+				$$ = $1;
+			}
+
+;
+
+FormalsList : 	FormalDecl
+				{
+					//apply the first Formal
+					vector<Formal> formals;
+					string name = ((Formal*)$1)->name;
+					string type = ((Formal*)$1)->type;
+					int size = ((Formal*)$1)->size;
+					Formal first(name, type, size);
+					formals.push_back(first);
+					$$ = new FormalList(formals);
+				}
+				| FormalDecl COMMA FormalsList
+				{
+					vector<Formal> new_formals;
+					vector<Formal> old_formals = ((FormalList*)$3)->formals;
+					string name = ((Formal*)$1)->name;
+					string type = ((Formal*)$1)->type;
+					int size = ((Formal*)$1)->size;
+					Formal first(name, type, size);
+					new_formals.push_back(first);
+					new_formals.insert(new_formals.end(), old_formals.begin(), old_formals.end());
+					$$ = new FormalList(new_formals);
+				}
+;
+
+FormalDecl :	Type ID
+				{
+					string name = ((Identifier*)$2)->name;
+					Record record = symbol_table.SymbolTableSearch(name);
+					if (record.offset != ERROR_TYPE)	{
+						errorDef(lineno, name);
+						exit(1);
+					}
+					else {
+						string type = ((Type*)$1)->type;
+						formalCount--;
+						Record new_rec(name, type, formalCount);
+						symbol_table.Record_insertion(new_rec, 0);
+						currFormals.push_back(type);
+						$$ = new Formal(name, type, 1);
+					}
+				}
+;
+
+PreConditions :	 /*epsilon*/
+                {
+                    $$ = new PreCondition("");
+                    for(int i = 0; i < precond_list.size(); i++){
+                        ((PreCondition*)$$)->false_list = BUFFER.merge(((PreCondition*)$$)->false_list, precond_list[i].false_list);
+                        if (i != precond_list.size() -1){
+                             BUFFER.bpatch(precond_list[i].true_list,precond_list[i].label);
+                        }
+                        else{
+                            ((PreCondition*)$$)->true_list = precond_list[i].true_list;
+                        }
+                     }
+                }
+
+				|PreConditions PreCondition
+				{
+					preCondsCount++;
+					precond_list.push_back(*((PreCondition*)$2));
+				}
+
+;
+
+PreCondition :		PRECOND LPAREN M_QUAD Exp RPAREN
+					{
+						string type = ((Expression*)$4)->type;
+						if (type != "bool")	{
+							errorMismatch(lineno);
+							exit(1);
+						}
+						$$ = new PreCondition(((MyString*)$3)->text);
+						((PreCondition*)$$)->true_list = ((Expression*)$4)->true_list;
+						((PreCondition*)$$)->false_list = ((Expression*)$4)->false_list;
+					}
+;
+
+Statements :		Statement
+                    {
+                        $$ = new Statement();
+                        ((Statement*)$$)->next_list = ((Statement*)$1)->next_list;
+                        ((Statement*)$$)->break_list = ((Statement*)$1)->break_list;
+                    }
+
+					| Statements M_QUAD Statement
+					{
+					    //idea : connect new Statement to the list statements
+					    //for adding statement i+1, backpatch statement i next list
+					    $$ = new Statement();
+					    BUFFER.bpatch(((Statement*)$1)->next_list, (((MyString*)$2)->text));
+					    ((Statement*)$$)->break_list = BUFFER.merge(((Statement*)$1)->break_list, ((Statement*)$3)->break_list);
+					    ((Statement*)$$)->next_list = ((Statement*)$3)->next_list;
+					}
+
+;
+
+Statement :			LBRACE {
+                            symbol_table.insertTable(&symbol_table.tables.top(),symbol_table.offsets.top());
+
+                            } Statements M_QUAD RBRACE
+                            {
+                                scoped_finished();
+                                symbol_table.RemoveTable();
+                                BUFFER.bpatch(((Statement*)$3)->next_list, (((MyString*)$4)->text));
+                                $$ = new Statement();
+                                ((Statement*)$$)->break_list = ((Statement*)$3)->break_list;
+                            }
+					| Type ID SC
+						{
+							string name1 = ((Identifier*)$2)->name;
+
+							Record current_record = symbol_table.SymbolTableSearch(name1);
+							if(current_record.offset == ERROR_TYPE){
+								Record new_record(name1,((Type*)$1)->type,symbol_table.offsets.top());
+								symbol_table.Record_insertion(new_record,1);
+							}
+							else
+							{
+								errorDef(lineno, name1);
+								exit(1);
+							}
+							$$ = new Statement();
+							BUFFER.emit("sub $sp, $sp, 4");
+							string reg = regs.allocateReg();
+							BUFFER.emit("li " + reg + " , 0");          //initiallize to 0
+							BUFFER.emit("sw " + reg + " , ($sp)");
+							regs.releaseReg();
+
+						}
+
+					| Type ID ASSIGN Exp SC
+					{
+						Record current_record = symbol_table.SymbolTableSearch(((Identifier*)$2)->name);
+						if (current_record.offset == ERROR_TYPE){
+							string type = ((Type*)$1)->type;
+							string expression_type = ((Expression*)$4)->type;
+							if(expression_type == "function")
+							{
+								errorMismatch(lineno);
+								exit(1);
+							}
+							else if(type != expression_type)
+							{
+								if (!(type == "int" && expression_type == "byte")){
+									errorMismatch(lineno);
+									exit(1);
+							    }
+							}
+                            Record new_record(((Identifier*)$2)->name,type,symbol_table.offsets.top());
+                            symbol_table.Record_insertion(new_record,1);
+                            //TODO : maybe the bug is here
+                            $$ = new Statement();
+                            if (type != "bool") {   //type is not a function nor error (otherwise shout error earlier)
+                                BUFFER.emit("sub $sp, $sp, 4");
+                                BUFFER.emit("sw " + ((Expression*)$4)->place + " , ($sp)");
+                                //register was allocated earlier - release anyway
+                            }
+                            else    {
+                                string reg = regs.allocateReg();
+                                string label_true = BUFFER.genLabelWithoutEmit();
+                                string label_false = BUFFER.genLabelWithoutEmit();
+                                string label_finish = BUFFER.genLabelWithoutEmit();
+                                BUFFER.bpatch(((Expression*)$4)->true_list, label_true);
+                                BUFFER.bpatch(((Expression*)$4)->false_list, label_false);
+                                BUFFER.emit(label_true + ": li " + reg + " , 1");
+                                BUFFER.emit("j " + label_finish);
+                                BUFFER.emit(label_false + ": li " + reg + " , 0");
+                                BUFFER.emit(label_finish + ": sub $sp , $sp, 4");
+                                BUFFER.emit("sw " + reg + " , ($sp)");
+                            }
+                            regs.releaseReg();
+						}
+                        else
+                        {
+                            errorDef(lineno,((Identifier*)$2)->name);
+                            exit(1);
+                        }
+                    }
+					| ID ASSIGN Exp SC
+					{
+						Record current_record = symbol_table.SymbolTableSearch(((Identifier*)$1)->name);
+						string expression_type;
+						if (current_record.offset == ERROR_TYPE || (current_record.type == "function")){
+
+							errorUndef(lineno, ((Identifier*)$1)->name);
+
+							exit(1);
+						}
+						else{
+							string type = current_record.type;
+							expression_type = ((Expression*)$3)->type;
+							if (type != expression_type){
+								if (!(type == "int" && expression_type =="byte")){
+									errorMismatch(lineno);
+									exit(1);
+								}
+							}
+						}
+						$$ = new Statement();
+						int offset = -4 * current_record.offset;
+						if (expression_type != "bool")  {
+						    string reg = ((Expression*)$3)->place;
+						    BUFFER.emit("sw " + reg + ", " + to_string(offset) + "($sp)");
+						    regs.releaseReg();
+						}
+						else    {
+						    string reg = regs.allocateReg();
+                            string label_true = BUFFER.genLabelWithoutEmit();
+                            string label_false = BUFFER.genLabelWithoutEmit();
+                            string label_finish = BUFFER.genLabelWithoutEmit();
+                            BUFFER.bpatch(((Expression*)$3)->true_list, label_true);
+                            BUFFER.bpatch(((Expression*)$3)->false_list, label_false);
+                            BUFFER.emit(label_true + ": li " + reg + " , 1");
+                            BUFFER.emit("j " + label_finish);
+                            BUFFER.emit(label_false + ": li " + reg + " , 0");
+                            BUFFER.emit(label_finish + " sw " + reg + ", " + to_string(offset) + "($fp)");
+						}
+						regs.releaseReg();
+					}
+
+
+					| Call SC
+					{
+					    $$ =  new Statement(); // todo: add func name save
+					}
+
+					| RETURN Exp SC
+
+					{
+						string type;
+						ScopedTable current_table = symbol_table.tables.top();
+                        ScopeFunc res = symbol_table.isInScopeFunc(((Expression*)$2)->type);
+                        if(((Expression*)$2)->type == "void"){
+                           errorMismatch(lineno);
+                            exit(1);
+                        }
+						if (res == NOT_FOUND){
+							errorSyn(lineno);
+							exit(1);
+						}
+						if (res == MISSMATCH){
+							errorMismatch(lineno);
+							exit(1);
+						}
+						if (((Expression*)$2)->type == "function"){
+							errorMismatch(lineno);
+							exit(1);
+						}
+						$$ =  new Statement();
+						if (((Expression*)$2)->type == "bool"){
+						   string reg = regs.allocateReg();
+                           string label_true = BUFFER.genLabelWithoutEmit();
+                           BUFFER.bpatch(((Expression*)$1)->true_list, label_true);
+                           string label_false = BUFFER.genLabelWithoutEmit();
+                           BUFFER.bpatch(((Expression*)$1)->false_list, label_false);
+                           string label_finish = BUFFER.genLabelWithoutEmit();
+                           BUFFER.emit(label_true + ": li " + reg + ", 1");
+                           BUFFER.emit("j " + label_finish);
+                           BUFFER.emit(label_true + ": li " + reg + ", 0");
+                           BUFFER.emit(label_finish + ": ");
+                           ((Expression*)$2)->place = reg; // todo: maybe the bug is here
+						}
+
+						BUFFER.emit("move $v0, " + ((Expression*)$2)->place);
+                        BUFFER.emit("move $sp, $fp");
+                        BUFFER.emit("add $sp, $sp, 4");
+                        BUFFER.emit("jr $ra");
+						regs.releaseReg();
+
+					}
+
+					| RETURN SC
+					{
+
+						string type;
+						ScopeFunc res = symbol_table.isInScopeFunc("void");
+
+						if (res == NOT_FOUND){
+							errorSyn(lineno);
+							exit(1);
+						}
+						if (res == MISSMATCH){
+							errorMismatch(lineno);
+							exit(1);
+						}
+						$$ = new Statement();
+						BUFFER.emit("move $sp, $fp");
+						BUFFER.emit("add $sp, $sp, 4");
+						BUFFER.emit("jr $ra");
+
+					}
+
+					| IF LPAREN Exp RPAREN M_QUAD
+
+					{
+						if (((Expression*)$3)->type != "bool") {
+							errorMismatch(lineno);
+							exit(1);
+						}
+						symbol_table.insertTable(&symbol_table.tables.top(),symbol_table.offsets.top());
+						BUFFER.bpatch(((Expression*)$3)->true_list, (((MyString*)$5)->text));
+					}
+
+					Statement
+					{
+
+						scoped_finished();
+						symbol_table.RemoveTable();
+						int goto_location = BUFFER.emit("j ");
+						((Statement*)$7)->next_list = BUFFER.merge(BUFFER.makelist(goto_location), ((Statement*)$7)->next_list);
+					}
+
+					M
+					{
+					    $$ = new Statement();
+					    if (((ElseStatement*)$9)->is_else){
+					        BUFFER.bpatch(((Expression*)$3)->false_list, ((ElseStatement*)$9)->label);
+					        ((Statement*)$$)->next_list = BUFFER.merge(((ElseStatement*)$9)->next_list,((Statement*)$7)->next_list);
+					    }
+					    else{
+					        ((Statement*)$$)->next_list = BUFFER.merge(((Expression*)$3)->false_list,((Statement*)$7)->next_list);
+					    }
+					    ((Statement*)$$)->break_list = BUFFER.merge(((ElseStatement*)$9)->break_list,((Statement*)$7)->break_list);
+					    ((Statement*)$$)->continue_list = BUFFER.merge(((ElseStatement*)$9)->continue_list,((Statement*)$7)->continue_list);
+
+					}
+
+					| WHILE M_QUAD LPAREN Exp RPAREN M_QUAD
+					{
+						string exp_type = ((Expression*)$3)->type;
+						if (exp_type == "bool"){
+							symbol_table.insertTable(&symbol_table.tables.top(),symbol_table.offsets.top(),"while_scope");
+						}
+						else{
+							errorMismatch(lineno);
+							exit(1);
+						}
+						BUFFER.bpatch(((Expression*)$4)->true_list, (((MyString*)$6)->text));
+					}
+					Statement {
+						scoped_finished();
+						symbol_table.RemoveTable();
+						int goto_location = BUFFER.emit("j " + (((MyString*)$2)->text));
+						BUFFER.bpatch(((Statement*)$8)->next_list, (((MyString*)$2)->text));
+						BUFFER.bpatch(((Statement*)$8)->continue_list, (((MyString*)$2)->text));   //TODO : check and test
+						$$ = new Statement();
+						((Statement*)$$)->next_list = BUFFER.merge(((Statement*)$8)->break_list, ((Expression*)$4)->false_list);
+					}
+
+
+					| BREAK SC
+					{
+					    if (symbol_table.isInScope("while_scope")==false)   {
+					        errorUnexpectedBreak(lineno);
+                            exit(1);
+                            }
+                       $$ = new Statement();
+                       int goto_location = BUFFER.emit("j ");
+                       ((Statement*)$$)->break_list = BUFFER.makelist(goto_location);
+					}
+
+					| CONTINUE SC
+
+					{
+                       if (symbol_table.isInScope("while_scope")==false)   {
+                            errorUnexpectedContinue(lineno);
+                            exit(1);
+                       }
+                       $$ = new Statement();
+                       int goto_location = BUFFER.emit("j ");
+                       ((Statement*)$$)->continue_list = BUFFER.makelist(goto_location);
+					}
+;
+
+M	:	%prec T
+            {
+                $$ = new ElseStatement(false, "");
+            }
+	|	ELSE M_QUAD
+					{
+						symbol_table.insertTable(&symbol_table.tables.top(),symbol_table.offsets.top());
+					}
+		Statement
+					{
+						scoped_finished();
+						symbol_table.RemoveTable();
+						int goto_location = BUFFER.emit("j ");
+						$$ = new ElseStatement(true, (((MyString*)$2)->text));
+						((ElseStatement*)$$)->next_list = BUFFER.merge(BUFFER.makelist(goto_location), ((Statement*)$4)->next_list);
+						((ElseStatement*)$$)->break_list = ((Statement*)$4)->break_list;
+						((ElseStatement*)$$)->continue_list = ((Statement*)$4)->continue_list;
+					}
+
+;
+
+Call :	ID LPAREN ExpList RPAREN
+		{
+			string name1 = ((Identifier*)$1)->name;
+			Record record = symbol_table.SymbolTableSearch(name1);
+			if (record.offset == ERROR_TYPE || record.parameters.empty())
+			{
+				errorUndefFunc(lineno, name1);
+				exit(1);
+			}
+			vector<Parameter> parameters = record.parameters;
+			vector<Parameter> exp_list_params  = ((ExpList*)$3)->expressions;
+
+			//vector<Parameter>::iterator func_params = ++parameters.begin();
+			//vector<Parameter>::iterator explist_params = ((ExpList*)$3)->expressions.begin();
+			int i = 1;
+			int j = 0;
+			int func_params_size = parameters.size();
+			int explist_params_size = ((ExpList*)$3)->expressions.size();
+			while (i < func_params_size && j < explist_params_size){
+				if (parameters[i].type != exp_list_params[j].type){
+					if (!(parameters[i].type == "int" && exp_list_params[j].type == "byte")){
+						break;
+					}
+				}
+
+				//todo: maybe the bug is here because types mismatch
+				if (parameters[i].size != exp_list_params[j].size){
+					break;
+				}
+				i++;
+				j++;
+			}
+			if (i < func_params_size || j < explist_params_size){
+				vector<string> types;
+				string capital;
+				for (int k=1; k < func_params_size; k++){
+					capital = upperCase(parameters[k].type);
+					types.push_back(capital);
+				}
+				errorPrototypeMismatch(lineno,name1,types);
+				exit(1);
+			}
+			$$ = new Type(parameters[0].type);
+			storeAll();
+			int args_counter=expressions_list.size();
+			while (!(expressions_list.empty())) {
+			    BUFFER.emit("sub $sp, $sp, 4");
+			    BUFFER.emit("sw " + expressions_list.top().name + ", ($sp)");
+			    expressions_list.pop();
+			}
+			assert(regs.next_available == 0);   //TODO : maybe the bug is here. + REMOVE.
+			string reg = regs.allocateReg();
+			BUFFER.emit("sub " + reg + " , $sp, 4");
+			BUFFER.emit("move $fp, " + reg);
+			regs.releaseReg();
+			BUFFER.emit("jal " + name1);    //TODO : maybe the bug is here
+			BUFFER.emit("add $sp, $sp, " + to_string(args_counter*4)); //TODO : maybe the bug is here
+			restoreAll();
+
+		}
+		| ID LPAREN RPAREN
+		{
+			string name1 = ((Identifier*)$1)->name;
+			Record record = symbol_table.SymbolTableSearch(name1);
+			if (record.offset == ERROR_TYPE || record.parameters.empty())
+			{
+				errorUndefFunc(lineno, name1);
+				exit(1);
+			}
+			vector<Parameter> parameters = record.parameters;
+			int func_params_size = parameters.size();
+			if (func_params_size != 1){
+				vector<string> types;
+				string capital;
+				for (int k=1; k < func_params_size; k++){
+					capital = upperCase(parameters[k].type);
+					types.push_back(capital);
+				}
+				errorPrototypeMismatch(lineno,name1,types);
+				exit(1);
+			}
+			$$ = new Type(parameters[0].type);
+			storeAll();
+            string reg = regs.allocateReg();
+            BUFFER.emit("sub " + reg + " , $sp, 4");
+            BUFFER.emit("move $fp, " + reg);
+            regs.releaseReg();
+            BUFFER.emit("jal " + name1);    //TODO : maybe the bug is here
+            restoreAll();
+
+		}
+;
+
+ExpList :	Exp
+			{
+				vector<Parameter> expressions;
+				string expr_name = ((Expression*)$1)->name;
+				string expr_type = ((Expression*)$1)->type;
+				int expr_size = ((Expression*)$1)->size;
+				Parameter expr(expr_name, expr_type, expr_size);
+				expressions.push_back(expr);
+				$$ = new ExpList(expressions);
+
+				if (expr_type != "bool")    {
+				    StackElement element(((Expression*)$1)->place, expr_type, 1);
+				    expressions_list.push(element);
+				}
+				else    {
+				    string reg = regs.allocateReg();
+				    string label_true = BUFFER.genLabelWithoutEmit();
+				    string label_false = BUFFER.genLabelWithoutEmit();
+				    string label_finish = BUFFER.genLabelWithoutEmit();
+				    BUFFER.bpatch(((Expression*)$1)->true_list, label_true);
+				    BUFFER.bpatch(((Expression*)$1)->false_list, label_false);
+				    BUFFER.emit(label_true + ": li " + reg + ", 1");
+				    BUFFER.emit("j " + label_finish);
+				    BUFFER.emit(label_true + ": li " + reg + ", 0");
+				    BUFFER.emit(label_finish + ": ");
+                    StackElement element(reg, expr_type, 1);
+                    expressions_list.push(element);
+				}
+
+			}
+			| Exp
+			{
+                string expr_type = ((Expression*)$1)->type;
+                if (expr_type != "bool")    {
+                    StackElement element(((Expression*)$1)->place, expr_type, 1);
+                    expressions_list.push(element);
+                }
+                else    {
+                    string reg = regs.allocateReg();
+                    string label_true = BUFFER.genLabelWithoutEmit();
+                    string label_false = BUFFER.genLabelWithoutEmit();
+                    string label_finish = BUFFER.genLabelWithoutEmit();
+                    BUFFER.bpatch(((Expression*)$1)->true_list, label_true);
+                    BUFFER.bpatch(((Expression*)$1)->false_list, label_false);
+                    BUFFER.emit(label_true + ": li " + reg + ", 1");
+                    BUFFER.emit("j " + label_finish);
+                    BUFFER.emit(label_true + ": li " + reg + ", 0");
+                    BUFFER.emit(label_finish + ": ");
+                    StackElement element(reg, expr_type, 1);
+                    expressions_list.push(element);
+                }
+
+			}
+			COMMA ExpList
+			{
+				vector<Parameter> expressions;
+				string expr_name = ((Expression*)$1)->name;
+				string expr_type = ((Expression*)$1)->type;
+				int expr_size = ((Expression*)$1)->size;
+				Parameter expr(expr_name, expr_type, expr_size);
+				expressions.push_back(expr);
+				vector<Parameter> old_expressions = ((ExpList*)$3)->expressions;
+				expressions.insert(expressions.end(),old_expressions.begin(),old_expressions.end());
+				$$ = new ExpList(expressions);
+			}
+;
+
+Type :	INT {$$ = new Type("int");}
+	  | BYTE {$$ = new Type("byte");}
+	  | BOOL {$$ = new Type("bool");}
+;
+
+Exp:	LPAREN Exp RPAREN
+			{
+				$$ = $2;
+			}
+		| Exp BINOP Exp
+			{
+				string exp1_type = ((Expression*)$1)->type;
+				string exp3_type = ((Expression*)$3)->type;
+				if (!(exp1_type == "int" || exp1_type == "byte")){
+				    errorMismatch(lineno);
+                    exit(1);
+				}
+				if (!(exp3_type == "int" || exp3_type == "byte")){
+                    errorMismatch(lineno);
+                    exit(1);
+                }
+                string new_type = "byte";
+                if (exp1_type == "int" || exp3_type == "int"){
+                    new_type = "int";
+                }
+				$$ = new Expression("", new_type, 1);
+                string E1_place = ((Expression*)$1)->place;
+                string E3_place = ((Expression*)$3)->place;
+                string binop = (((MyString*)$2)->text);
+                Binops binop_in_enum;
+                if (binop == "+"){
+                    binop_in_enum = Binops::PLUS;
+                }
+                if(binop == "-"){
+                    binop_in_enum = Binops::MINUS;
+                }
+                if(binop == "*"){
+                    binop_in_enum = Binops::MUL;
+                }
+                if(binop == "/"){
+                    binop_in_enum = Binops::DIV;
+                }
+                switch (binop_in_enum)  {
+                    case PLUS : {
+                        if (new_type == "int")  BUFFER.emit("add " + E1_place + ", " + E1_place + ", " + E3_place);
+                        else    BUFFER.emit("addu " + E1_place + ", " + E1_place + ", " + E3_place);
+                    }
+                    case MINUS : {
+                        if (new_type == "int")  BUFFER.emit("sub " + E1_place + ", " + E1_place + ", " + E3_place);
+                        else    BUFFER.emit("subu " + E1_place + ", " + E1_place + ", " + E3_place);
+                    }
+                    case MUL : BUFFER.emit("mul " + E1_place + ", " + E1_place + ", " + E3_place);
+                    case DIV : {
+                        string notByZero = BUFFER.genLabelWithoutEmit();
+                        BUFFER.emit("bne " + E3_place + " , 0, " + notByZero);  //apply jump for legal division
+                        BUFFER.emit("li $v0 , 4");  //print string (for zero division)
+                        BUFFER.emit("la $a0, zeroDivision");
+                        BUFFER.emit("syscall");
+                        BUFFER.emit("li $v0 , 10");  //terminate (for zero division)
+                        BUFFER.emit("syscall");
+                        BUFFER.emit(notByZero + ": div " + E1_place + ", " + E1_place + ", " + E3_place);
+                    }
+                    default : assert(false);        //TODO : remove
+                }
+                if (new_type == "byte") {     //force overflow detection
+                    BUFFER.emit("and " + E1_place + ", " + E1_place + ", 255");
+                }
+                ((Expression*)$$)->place = E1_place;
+                regs.releaseReg();
+			}
+		| ID
+			{
+				string name1 = ((Identifier*)$1)->name;
+				Record record = symbol_table.SymbolTableSearch(name1);
+				if (record.offset == ERROR_TYPE || record.parameters.size()>0)
+				{
+					errorUndef(lineno, name1);
+					exit(1);
+				}
+				else	{
+					$$ = new Expression(record.name, record.type, 1);
+					int offset = -4 * record.offset;
+					string reg = regs.allocateReg();
+					BUFFER.emit("lw " + reg + ", " + to_string(offset) + "($fp)");
+					if (record.type == "bool")  {       //TODO : take a second look
+					    int goto_location = BUFFER.emit("bne " + reg + ", 0, "  );
+					    ((Expression*)$$)->true_list = BUFFER.makelist(goto_location);
+					    goto_location = BUFFER.emit("j ");
+					    ((Expression*)$$)->false_list = BUFFER.makelist(goto_location);
+					    regs.releaseReg();
+					}
+					else    {       //type has value that might be used
+					    ((Expression*)$$)->place = reg;
+					}
+				}
+
+			}
+		| Call      //TODO : take a second look
+			{
+				string new_type = ((Type*)$1)->type;
+				$$ = new Expression("", new_type, 1);
+				if (new_type != "void") {
+				    if (new_type == "bool") {
+                        int goto_location = BUFFER.emit("beq $v0, 1,");
+                        ((Expression*)$$)->true_list = BUFFER.makelist(goto_location);
+                        goto_location = BUFFER.emit("j ");
+                       ((Expression*)$$)->false_list = BUFFER.makelist(goto_location);
+				    }
+				    else    {       // new_type is int or byte
+				        string reg = regs.allocateReg();
+				        BUFFER.emit("move " + reg + ", $v0");
+				        ((Expression*)$$)->place = reg;
+				    }
+			    }
+			}
+		| NUM
+			{
+				$$ = new Expression("", "int", 1);
+				string reg = regs.allocateReg();
+                ((Expression*)$$)->place = reg;
+                BUFFER.emit("li " + reg + ", " + ((Var*)$1)->value);
+			}
+		| NUM B
+			{
+				int value = ((Var*)$1)->numeric_value;
+				if (value > 255)
+				{
+					string str_value = ((Var*)$1)->value;
+					errorByteTooLarge(lineno, str_value);
+					exit(1);
+				}
+				$$ = new Expression("", "byte", 1);
+				string reg = regs.allocateReg();
+				((Expression*)$$)->place = reg;
+				BUFFER.emit("li " + reg + ", " + ((Var*)$1)->value);
+			}
+		| STRING
+			{
+				$$ = new Expression("", "string", 1);
+				string reg = regs.allocateReg();
+				((Expression*)$$)->place = reg;
+
+				string_counter++;
+				string label = "string__" + to_string(string_counter);
+				BUFFER.emitData(label + ": .asciiz  \"" + ((MyString*)$1)->text +"\"");
+
+
+				BUFFER.emit("la " + reg + ", " + label);
+			}
+		| TRUE      //TODO : take a second look
+			{
+				$$ = new Expression("", "bool", 1);
+				int goto_location = BUFFER.emit("j ");
+				((Expression*)$$)->true_list = BUFFER.makelist(goto_location);
+			}
+		| FALSE     //TODO : take a second look
+			{
+				$$ = new Expression("", "bool", 1);
+				int goto_location = BUFFER.emit("j ");
+                ((Expression*)$$)->false_list = BUFFER.makelist(goto_location);
+			}
+		| NOT Exp
+			{
+				string type = ((Expression*)$2)->type;
+				if (type!="bool")	{
+					errorMismatch(lineno);
+					exit(1);
+				}
+				$$ = new Expression("", "bool", 1);
+				((Expression*)$$)->false_list = ((Expression*)$2)->true_list;
+				((Expression*)$$)->true_list = ((Expression*)$2)->false_list;
+			}
+		| Exp AND M_QUAD Exp
+			{
+				string type1 = ((Expression*)$1)->type;
+				string type3 = ((Expression*)$3)->type;
+				if (type1!="bool" || type3!="bool")	{
+					errorMismatch(lineno);
+					exit(1);
+				}
+				$$ = new Expression("", "bool", 1);
+				BUFFER.bpatch(((Expression*)$1)->true_list, (((MyString*)$3)->text));
+				((Expression*)$$)->true_list = ((Expression*)$4)->true_list;
+				((Expression*)$$)->false_list = BUFFER.merge(((Expression*)$1)->false_list, ((Expression*)$4)->false_list);
+			}
+		| Exp OR M_QUAD Exp
+			{
+				string type1 = ((Expression*)$1)->type;
+				string type3 = ((Expression*)$3)->type;
+				if (type1!="bool" || type3!="bool")	{
+					errorMismatch(lineno);
+					exit(1);
+				}
+				$$ = new Expression("", "bool", 1);
+                BUFFER.bpatch(((Expression*)$1)->false_list, (((MyString*)$3)->text));
+                ((Expression*)$$)->false_list = ((Expression*)$4)->false_list;
+                ((Expression*)$$)->true_list = BUFFER.merge(((Expression*)$1)->true_list, ((Expression*)$4)->true_list);
+			}
+		| Exp RELOP Exp
+			{
+				string type1 = ((Expression*)$1)->type;
+				string type3 = ((Expression*)$3)->type;
+				if ((type1!="int"&&type1!="byte")||(type3!="int"&&type3!="byte"))	{
+					errorMismatch(lineno);
+					exit(1);
+				}
+				$$ = new Expression("", "bool", 1);
+				int goto_location;
+				string E1_place = ((Expression*)$1)->place;
+				string E3_place = ((Expression*)$3)->place;
+				string relop = (((MyString*)$2)->text);
+				Relops relops;
+				if (relop == ">="){
+				    relops =Relops::BGE;
+				}
+				if (relop == "<="){
+                    relops =Relops::BLE;
+                }
+                if (relop == ">"){
+                    relops =Relops::BGT;
+                }
+                if (relop == "<"){
+                    relops =Relops::BLT;
+                }
+                if (relop == "=="){
+                    relops =Relops::BEQ;
+                }
+                if (relop == "!="){
+                    relops =Relops::BNE;
+                }
+				switch (relops)  {
+				    case BGE : goto_location = BUFFER.emit("bge" + E1_place+ ", " + E3_place + ", ");
+				    case BLE : goto_location = BUFFER.emit("ble" + E1_place+ ", " + E3_place + ", ");
+				    case BGT : goto_location = BUFFER.emit("bgt" + E1_place+ ", " + E3_place + ", ");
+				    case BLT : goto_location = BUFFER.emit("blt" + E1_place+ ", " + E3_place + ", ");
+                    case BEQ : goto_location = BUFFER.emit("beq" + E1_place+ ", " + E3_place + ", ");
+                    case BNE : goto_location = BUFFER.emit("bne" + E1_place+ ", " + E3_place + ", ");
+				    default : assert(false);        //TODO : remove
+				}
+				((Expression*)$$)->true_list = BUFFER.makelist(goto_location);
+				goto_location = BUFFER.emit("j ");
+				((Expression*)$$)->false_list = BUFFER.makelist(goto_location);
+				regs.releaseReg();
+				regs.releaseReg();
+			}
+;
+
+M_QUAD  :   {
+                $$ = new MyString(BUFFER.genLabel());
+            }
+
+%%
+
+void yyerror(const char*)	{	output::errorSyn(lineno);	exit(1);}
+
+int main()	{
+	int x = yyparse();
+	BUFFER.emitData("zeroLabel: .asciiz  \"Error division by zero\\n\"");
+	BUFFER.emitData("zeroLabel: .asciiz  \"Precondition hasn't been satisfied for function \"");
+	BUFFER.printDataBuffer();
+    BUFFER.printCodeBuffer();
+	{
+
+
+        Record main = symbol_table.SymbolTableSearch("main");
+        if(main.offset == ERROR_TYPE ){
+            output::errorMainMissing();
+            exit(1);
+        }
+        if(main.parameters.size()!=1){
+            errorMainMissing();
+            exit(1);
+        }
+        if(main.parameters[0].type != "void"){
+            errorMainMissing();
+            exit(1);
+        }
+        endScope();
+        symbol_table.tables.top().PrintTableBeforeRemove();
+        symbol_table.tables.pop();
+        symbol_table.offsets.pop();
+
+
+
+    }
+    return x;
+}
+
+void scoped_finished() {
+	endScope();
+	vector<Record> records = symbol_table.tables.top().records;
+	for (int i = 0; i < records.size(); i++) {
+		string curr_type = records[i].type;
+		if (curr_type == "function") {
+
+			string name = records[i].name;
+			vector<string> parameters;
+			string ret_type = upperCase(records[i].parameters[0].type);
+			for(int j=1; j<records[i].parameters.size() ; j++) {
+				parameters.push_back(upperCase(records[i].parameters[j].type));
+			}
+			string func_type = makeFunctionType(ret_type, parameters);
+
+			printID(name, 0, func_type);
+		}
+		else {
+			printID(records[i].name,records[i].offset,upperCase(curr_type));
+			
+		}
+	}
+}
+
+string upperCase(string type){
+	string capital = "";
+	for(int i=0; i < type.length(); i++){
+		capital += toupper(type[i]);
+	}
+	return capital;
+}
+
+void storeAll() {
+    storeRegs();
+    storeFP();
+    storeRA();
+}
+
+void restoreAll()   {
+    popRA();
+    popFP();
+    restoreRegs();
+}
+
+void storeRegs()    {
+    vector<string> taken_regs;
+    //TODO : maybe the bug is here
+    int temp = regs.next_available;
+    for (int i=temp-1; i>=0; i--)   {
+        taken_regs.push_back(getRegName(i));
+        BUFFER.emit("sub $sp, $sp, 4");
+        BUFFER.emit("sw " + getRegName(i) + ", ($sp)");
+        regs.releaseReg();
+    }
+    regsToRestore.push(taken_regs);
+}
+
+void restoreRegs()  {
+    vector<string> to_restore;
+    to_restore = regsToRestore.top();
+    for (int i=to_restore.size()-1; i>=0; i--)  {
+        string reg = regs.allocateReg();
+        BUFFER.emit("lw " + reg + ", ($sp)");
+        BUFFER.emit("add $sp, $sp, 4");
+    }
+    regsToRestore.pop();
+}
+
+void storeFP()  {
+    BUFFER.emit("sub $sp, $sp, 4");
+    BUFFER.emit("sw $fp, ($sp)");
+}
+
+void popFP()    {
+    BUFFER.emit("lw $fp, ($sp)");
+    BUFFER.emit("add %sp, $sp, 4");
+}
+
+void storeRA()  {
+    BUFFER.emit("sub $sp, $sp, 4");
+    BUFFER.emit("sw $ra, ($sp)");
+}
+
+void popRA()    {
+    BUFFER.emit("lw $ra, ($sp)");
+    BUFFER.emit("add %sp, $sp, 4");
+}
